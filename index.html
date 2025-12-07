@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>WebAR クリエイティブ空間 - ハンドトラッキング描画</title>
+    
+    <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
+    
+    <script src="https://cdn.jsdelivr.net/npm/mind-ar@1.2.0/dist/mindar-image-aframe.prod.js"></script>
+    
+    <script>
+        // --- A. 描画設定を管理するコンポーネント ---
+        AFRAME.registerComponent('drawing-settings', {
+            schema: {
+                currentColor: {type: 'color', default: '#FF00FF'},
+                mode: {type: 'string', default: 'draw'} // 'draw' または 'erase'
+            },
+            init: function () {
+                window.drawingSettings = this; 
+            },
+            setColor: function (newColor) {
+                this.data.currentColor = newColor;
+            },
+            setMode: function (newMode) {
+                if (newMode === 'draw' || newMode === 'erase') {
+                    this.data.mode = newMode;
+                }
+            }
+        });
+
+        // --- B. 3Dパレットの色選択コンポーネント ---
+        AFRAME.registerComponent('color-picker', {
+            schema: {
+                pickColor: {type: 'color', default: '#FFFFFF'}
+            },
+            init: function () {
+                this.settings = document.querySelector('a-scene').components['drawing-settings'];
+                // AR空間での操作のため、ここではクリックイベントを使用
+                this.el.addEventListener('click', this.changeColor.bind(this));
+            },
+            changeColor: function () {
+                if (this.settings) {
+                    this.settings.setColor(this.data.pickColor);
+                }
+            }
+        });
+
+        // --- C. モード切り替えコンポーネント ---
+        AFRAME.registerComponent('mode-switch', {
+            schema: {
+                targetMode: {type: 'string', default: 'draw'}
+            },
+            init: function () {
+                this.settings = document.querySelector('a-scene').components['drawing-settings'];
+                this.el.addEventListener('click', this.switchMode.bind(this));
+            },
+            switchMode: function () {
+                if (this.settings) {
+                    this.settings.setMode(this.data.targetMode);
+                }
+            }
+        });
+
+        // --- D. WebSocket 受信コンポーネント (ペアリング用) ---
+        // MindAR環境では複雑になるため、ロジックは最小限に留めます
+        AFRAME.registerComponent('ws-receiver', {
+            schema: {
+                serverUrl: {type: 'string', default: 'ws://localhost:8080'}
+            },
+            init: function () {
+                this.settings = document.querySelector('a-scene').components['drawing-settings'];
+            },
+        });
+
+        // --- E. 指の位置をトラッキングし、描画を制御するコンポーネント ---
+        AFRAME.registerComponent('hand-drawing-controller', {
+            schema: {
+                // 描画開始を判定するジェスチャー (MindARではpinchイベントを使用)
+                eraseRadius: {type: 'number', default: 0.15}
+            },
+            
+            init: function () {
+                this.isDrawing = false;
+                this.currentLine = null;
+                this.sceneEl = document.querySelector('a-scene');
+
+                // MindARから指の先端エンティティ（このコンポーネントがアタッチされている要素）を取得
+                const indexTip = this.el; 
+                this.settings = this.sceneEl.components['drawing-settings'];
+
+                // MindARのジェスチャーイベントをリッスン
+                indexTip.addEventListener('pinchstarted', this.onInputStart.bind(this));
+                indexTip.addEventListener('pinchended', this.onInputEnd.bind(this));
+            },
+            
+            onInputStart: function () {
+                if (!this.settings) return;
+
+                const mode = this.settings.data.mode; 
+                if (mode === 'draw' && !this.isDrawing) {
+                    this.startDrawing();
+                }
+            },
+
+            onInputEnd: function () {
+                if (this.isDrawing) {
+                    this.stopDrawing();
+                }
+            },
+
+            startDrawing: function () {
+                this.isDrawing = true;
+                this.currentLine = document.createElement('a-entity');
+                
+                const currentColor = this.settings.data.currentColor; 
+                
+                this.currentLine.setAttribute('line', {
+                    color: currentColor,
+                    opacity: 1,
+                    path: []
+                });
+                
+                this.currentLine.classList.add('drawn-line');
+                this.sceneEl.appendChild(this.currentLine);
+            },
+
+            stopDrawing: function () {
+                this.isDrawing = false;
+                this.currentLine = null;
+            },
+
+            tick: function () {
+                const settings = this.sceneEl.components['drawing-settings'];
+                if (!settings) return;
+
+                const mode = settings.data.mode;
+                
+                // 指先の現在の位置を取得
+                const indexTip = this.el;
+                const position = indexTip.object3D.position; 
+                
+                if (mode === 'draw' && this.isDrawing) {
+                    // 描画モードで、ピンチジェスチャー中の場合
+                    this.updateDrawing(position);
+                } else if (mode === 'erase' && indexTip.is('pinch')) { 
+                    // 消しゴムモードで、ピンチジェスチャー中の場合
+                    this.eraseNearbyLines(position);
+                }
+            },
+            
+            updateDrawing: function(position) {
+                let path = this.currentLine.getAttribute('line').path;
+                
+                // 指の位置を直接使う
+                const worldPos = position.clone();
+                path.push(`${worldPos.x} ${worldPos.y} ${worldPos.z}`);
+                
+                this.currentLine.setAttribute('line', 'path', path);
+            },
+
+            // 難題：距離感の認識による消しゴム処理 (VR版のロジックを流用)
+            eraseNearbyLines: function(eraserPosition) {
+                const THREE = window.THREE; 
+                const radius = this.data.eraseRadius;
+                const drawnLines = this.sceneEl.querySelectorAll('.drawn-line');
+
+                drawnLines.forEach(lineEl => {
+                    if (!lineEl.hasAttribute('line')) return;
+                    const linePath = lineEl.getAttribute('line').path;
+                    
+                    for (let i = 0; i < linePath.length; i++) {
+                        const pointStr = linePath[i];
+                        const parts = pointStr.split(' ').map(Number);
+                        const point = new THREE.Vector3(parts[0], parts[1], parts[2]);
+                        const distance = eraserPosition.distanceTo(point); 
+                        
+                        if (distance < radius) {
+                            lineEl.parentNode.removeChild(lineEl);
+                            return; 
+                        }
+                    }
+                });
+            }
+        });
+    </script>
+</head>
+<body>
+    <a-scene mindar-image="imageTargetSrc: targets.mind;" 
+             mindar-hand 
+             vr-mode-ui="enabled: false" 
+             device-orientation-permission-ui="enabled: false"> 
+        
+        <a-entity drawing-settings="currentColor: #FFFF00;"></a-entity>
+        <a-entity ws-receiver></a-entity>
+
+        <a-entity mindar-hand="type: right; visible: true" id="hand-target"> 
+            
+            <a-entity mindar-target="#index-finger-tip" id="index-finger-tip" hand-drawing-controller>
+                <a-sphere radius="0.01" color="#FFFFFF" opacity="0.8"></a-sphere>
+            </a-entity> 
+        </a-entity>
+
+        <a-entity camera></a-entity>
+        <a-entity light="type: ambient; color: #FFF; intensity: 1"></a-entity>
+
+        <a-entity position="0 0 -0.5"> 
+            <a-box width="1" height="0.1" depth="0.5" color="#555555" shadow></a-box>
+
+            <a-sphere position="-0.3 0.2 0" radius="0.1" color="#FF0000" 
+                      color-picker="pickColor: #FF0000"></a-sphere>
+                      
+            <a-sphere position="0 0.2 0" radius="0.1" color="#00FF00" 
+                      color-picker="pickColor: #00FF00"></a-sphere>
+
+            <a-sphere position="0.3 0.2 0" radius="0.1" color="#0000FF" 
+                      color-picker="pickColor: #0000FF"></a-sphere>
+
+            <a-box position="-0.25 0.2 -0.25" width="0.2" height="0.2" depth="0.05" color="#00FF7F" 
+                   mode-switch="targetMode: draw">
+                <a-text value="DRAW" align="center" width="1" position="0 0 0.03" color="#000000"></a-text>
+            </a-box>
+
+            <a-box position="0.25 0.2 -0.25" width="0.2" height="0.2" depth="0.05" color="#FF7F00" 
+                   mode-switch="targetMode: erase">
+                <a-text value="ERASE" align="center" width="1" position="0 0 0.03" color="#000000"></a-text>
+            </a-box>
+
+        </a-entity>
+        
+    </a-scene>
+</body>
+</html>
