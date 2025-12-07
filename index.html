@@ -2,7 +2,7 @@
 <html>
 <head>
     <meta charset="utf-8">
-    <title>WebVR クリエイティブ空間</title>
+    <title>WebVR クリエイティブ空間 - 描画と3Dパレット</title>
     
     <script src="https://aframe.io/releases/1.5.0/aframe.min.js"></script>
     
@@ -10,19 +10,226 @@
     <script src="https://cdn.jsdelivr.net/gh/donmccurdy/aframe-extras@v6.1.1/dist/aframe-extras.min.js"></script>
     <script src="https://cdn.jsdelivr.net/gh/c-frame/aframe-physics-extras@v0.1.0/dist/aframe-physics-extras.min.js"></script>
 
-    </head>
-<body>
-    <a-scene background="color: #000000" physics="gravity: 0">
+    <script>
+        // --- A. 描画設定を管理するコンポーネント (ステップ 4) ---
+        AFRAME.registerComponent('drawing-settings', {
+            schema: {
+                currentColor: {type: 'color', default: '#FF00FF'}, // 初期描画色
+                mode: {type: 'string', default: 'draw'}           // 'draw' または 'erase'
+            },
+            init: function () {
+                // シーン全体からアクセスできるように設定
+                window.drawingSettings = this; 
+                console.log("Drawing Settings Initialized.");
+            },
+            
+            // 色を変更するパブリックメソッド
+            setColor: function (newColor) {
+                this.data.currentColor = newColor;
+                console.log("Color set to: " + newColor);
+            },
+            
+            // モードを変更するパブリックメソッド
+            setMode: function (newMode) {
+                if (newMode === 'draw' || newMode === 'erase') {
+                    this.data.mode = newMode;
+                    console.log("Mode set to: " + newMode);
+                }
+                // モードに応じて、シーン内のパレット要素を視覚的にフィードバックすることも可能
+                this.el.emit('modechanged', {mode: newMode});
+            }
+        });
 
+        // --- B. 3Dパレットの色選択コンポーネント (ステップ 5) ---
+        AFRAME.registerComponent('color-picker', {
+            schema: {
+                pickColor: {type: 'color', default: '#FFFFFF'} // このオブジェクトの色
+            },
+            init: function () {
+                this.settings = document.querySelector('a-scene').components['drawing-settings'];
+                
+                // オブジェクトをクリックまたは掴んだときに色を切り替える
+                this.el.addEventListener('click', this.changeColor.bind(this));
+                
+                // ホバー時のフィードバック
+                this.el.addEventListener('mouseenter', () => {
+                    this.el.setAttribute('scale', '1.2 1.2 1.2');
+                });
+                this.el.addEventListener('mouseleave', () => {
+                    this.el.setAttribute('scale', '1 1 1');
+                });
+            },
+            changeColor: function () {
+                if (this.settings) {
+                    this.settings.setColor(this.data.pickColor);
+                }
+            }
+        });
+
+        // --- C. モード切り替えコンポーネント (ステップ 5) ---
+        AFRAME.registerComponent('mode-switch', {
+            schema: {
+                targetMode: {type: 'string', default: 'draw'} // 'draw' または 'erase'
+            },
+            init: function () {
+                this.settings = document.querySelector('a-scene').components['drawing-settings'];
+                this.el.addEventListener('click', this.switchMode.bind(this));
+            },
+            switchMode: function () {
+                if (this.settings) {
+                    this.settings.setMode(this.data.targetMode);
+                }
+            }
+        });
+
+        // --- D. 描画コンポーネント (ステップ 4 - 修正版) ---
+        AFRAME.registerComponent('drawing', {
+            schema: {
+                target: {type: 'selector', default: 'a-camera'}, 
+                eraseRadius: {type: 'number', default: 0.15} // 消しゴムの半径 (メートル)
+            },
+            
+            init: function () {
+                this.isDrawing = false;
+                this.currentLine = null;
+                this.sceneEl = document.querySelector('a-scene');
+
+                this.el.addEventListener('mousedown', this.onInputStart.bind(this));
+                this.el.addEventListener('mouseup', this.onInputEnd.bind(this));
+                
+                this.settings = this.sceneEl.components['drawing-settings']; 
+                if (!this.settings) {
+                    console.error("drawing-settingsコンポーネントがシーンに見つかりません！");
+                }
+            },
+
+            onInputStart: function () {
+                const mode = this.settings.data.mode; 
+                
+                if (mode === 'draw') {
+                    this.startDrawing();
+                }
+            },
+
+            onInputEnd: function () {
+                if (this.isDrawing) {
+                    this.stopDrawing();
+                }
+            },
+
+            startDrawing: function () {
+                this.isDrawing = true;
+                this.currentLine = document.createElement('a-entity');
+                const currentColor = this.settings.data.currentColor; 
+                
+                this.currentLine.setAttribute('line', {
+                    color: currentColor,
+                    opacity: 1,
+                    path: []
+                });
+                
+                this.currentLine.classList.add('drawn-line');
+                this.sceneEl.appendChild(this.currentLine);
+            },
+
+            stopDrawing: function () {
+                this.isDrawing = false;
+                this.currentLine = null;
+            },
+
+            tick: function () {
+                const mode = this.settings.data.mode;
+                const position = this.el.object3D.position;
+                
+                if (mode === 'draw' && this.isDrawing) {
+                    this.updateDrawing(position);
+                } else if (mode === 'erase' && this.el.is('mousedown')) {
+                    // 消しゴムモードでクリック/トリガーを押している場合
+                    this.eraseNearbyLines(position);
+                }
+            },
+            
+            updateDrawing: function(position) {
+                let path = this.currentLine.getAttribute('line').path;
+                path.push(`${position.x} ${position.y} ${position.z}`);
+                this.currentLine.setAttribute('line', 'path', path);
+            },
+
+            // 難題：距離感の認識による消しゴム処理
+            eraseNearbyLines: function(eraserPosition) {
+                // THREE.Vector3を一時的に参照 (A-Frameは内部でThree.jsを使用)
+                const THREE = window.THREE; 
+                const radius = this.data.eraseRadius;
+                const drawnLines = this.sceneEl.querySelectorAll('.drawn-line');
+
+                drawnLines.forEach(lineEl => {
+                    if (!lineEl.hasAttribute('line')) return; // line属性がない場合はスキップ
+
+                    const linePath = lineEl.getAttribute('line').path;
+                    
+                    for (let i = 0; i < linePath.length; i++) {
+                        const pointStr = linePath[i];
+                        const parts = pointStr.split(' ').map(Number);
+                        
+                        // 線の頂点の座標
+                        const point = new THREE.Vector3(parts[0], parts[1], parts[2]);
+
+                        // 消しゴムの位置と線の頂点の距離を計算
+                        const distance = eraserPosition.distanceTo(point); 
+                        
+                        if (distance < radius) {
+                            // 距離が近ければ、線全体を削除し、次の線へ
+                            lineEl.parentNode.removeChild(lineEl);
+                            return; 
+                        }
+                    }
+                });
+            }
+        });
+    </script>
+</head>
+<body>
+    <a-scene background="color: #000000" physics="gravity: 0" drawing-settings="currentColor: #FFFF00;"> 
+        
         <a-entity light="type: ambient; color: #BBB"></a-entity>
         <a-entity light="type: directional; color: #FFF; intensity: 0.6" position="-0.5 1 1"></a-entity>
+        <a-plane position="0 0 -4" rotation="-90 0 0" width="10" height="10" color="#333333"></a-plane>
 
-        <a-entity camera look-controls position="0 1.6 0">
+        <a-entity camera look-controls position="0 1.6 0" drawing>
             <a-cursor raycaster="objects: .collidable"></a-cursor>
         </a-entity>
         
-        <a-plane position="0 0 -4" rotation="-90 0 0" width="10" height="10" color="#333333"></a-plane>
+        <a-box id="myBox" position="0 1.5 -3" rotation="0 45 0" color="#4CC3D9"
+               shadow
+               static-body="shape: box" 
+               grabbable 
+               hoverable>
+        </a-box>
 
-        </a-scene>
+        <a-entity position="2 1 -3" rotation="0 45 0">
+            <a-box width="1" height="0.1" depth="0.5" color="#555555" shadow></a-box>
+
+            <a-sphere position="-0.3 0.2 0" radius="0.1" color="#FF0000" 
+                      color-picker="pickColor: #FF0000" grabbable static-body="shape: sphere" class="collidable"></a-sphere>
+                      
+            <a-sphere position="0 0.2 0" radius="0.1" color="#00FF00" 
+                      color-picker="pickColor: #00FF00" grabbable static-body="shape: sphere" class="collidable"></a-sphere>
+
+            <a-sphere position="0.3 0.2 0" radius="0.1" color="#0000FF" 
+                      color-picker="pickColor: #0000FF" grabbable static-body="shape: sphere" class="collidable"></a-sphere>
+
+            <a-box position="-0.25 0.2 -0.25" width="0.2" height="0.2" depth="0.05" color="#00FF7F" 
+                   mode-switch="targetMode: draw" class="collidable">
+                <a-text value="DRAW" align="center" width="1" position="0 0 0.03" color="#000000"></a-text>
+            </a-box>
+
+            <a-box position="0.25 0.2 -0.25" width="0.2" height="0.2" depth="0.05" color="#FF7F00" 
+                   mode-switch="targetMode: erase" class="collidable">
+                <a-text value="ERASE" align="center" width="1" position="0 0 0.03" color="#000000"></a-text>
+            </a-box>
+
+        </a-entity>
+        
+    </a-scene>
 </body>
 </html>
